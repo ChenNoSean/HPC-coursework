@@ -15,10 +15,10 @@ echo Slurm job ID is $SLURM_JOB_ID
 echo This job runs on the following machines:
 echo `echo $SLURM_JOB_NODELIST | uniq`
 
-GRID=128x128
+#GRID=128x128
 #GRID=128x256
 #GRID=256x256
-#GRID=1024x1024
+GRID=1024x1024
 
 #! Run the executable
 ./d2q9-bgk input_$GRID.params obstacles_$GRID.dat
