@@ -3,7 +3,7 @@
 #SBATCH --job-name=d2q9-bgk
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=1
+#SBATCH --cpus-per-task=144
 #SBATCH --time=00:10:00
 #SBATCH --output=d2q9-bgk.out
 #SBATCH --exclusive 
@@ -14,6 +14,10 @@ echo Directory is `pwd`
 echo Slurm job ID is $SLURM_JOB_ID
 echo This job runs on the following machines:
 echo `echo $SLURM_JOB_NODELIST | uniq`
+
+export OMP_NUM_THREADS=$SLURM_CPUS_PER_TASK
+export OMP_PLACES=cores
+export OMP_PROC_BIND=close
 
 #GRID=128x128
 #GRID=128x256

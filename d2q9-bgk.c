@@ -20,6 +20,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <omp.h>
 
 #define NSPEEDS         9
 #define FINALSTATEFILE  "final_state.dat"
@@ -176,7 +177,7 @@ int accelerate_flow(const t_param params, float* restrict cells, int* restrict o
   /* modify the 2nd row of the grid */
   int jj = params.ny - 2;
 
-  #pragma omp simd
+  #pragma omp parallel for simd default(none) shared(cells, obstacles, jj, w1, w2) schedule(static)
   for (int ii = 0; ii < params.nx; ii++)
   {
     /* if the cell is not occupied and
@@ -318,6 +319,7 @@ int collision(const t_param params, float* restrict cells, float* restrict tmp_c
     tmp_cells[SPEED_IDX(ii, jj, 8, params.nx, params.ny)] = obs ? p6 : c8; \
   } while(0)
 
+  #pragma omp parallel for default(none) shared(cells, tmp_cells, obstacles) schedule(static)
   for (int jj = 0; jj < params.ny; jj++)
   {
     int y_n = (jj + 1) % params.ny;
@@ -359,6 +361,7 @@ float av_velocity(const t_param params, float* cells, int* obstacles)
   tot_u = 0.f;
 
   /* loop over all non-blocked cells */
+  #pragma omp parallel for default(none) shared(cells, obstacles) reduction(+:tot_u, tot_cells) schedule(static)
   for (int jj = 0; jj < params.ny; jj++)
   {
     for (int ii = 0; ii < params.nx; ii++)
@@ -456,6 +459,7 @@ int initialise(const char* paramfile, const char* obstaclefile,
   float w1 = params->density      / 9.f;
   float w2 = params->density      / 36.f;
 
+  #pragma omp parallel for default(none) shared(cells_ptr, params, w0, w1, w2) schedule(static)
   for (int jj = 0; jj < params->ny; jj++)
   {
     for (int ii = 0; ii < params->nx; ii++)
@@ -476,6 +480,7 @@ int initialise(const char* paramfile, const char* obstaclefile,
   }
 
   /* first set all cells in obstacle array to zero */
+  #pragma omp parallel for default(none) shared(obstacles_ptr, params) schedule(static)
   for (int jj = 0; jj < params->ny; jj++)
   {
     for (int ii = 0; ii < params->nx; ii++)
