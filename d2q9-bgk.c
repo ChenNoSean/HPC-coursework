@@ -55,6 +55,7 @@
 #include <time.h>
 #include <sys/time.h>
 #include <sys/resource.h>
+#include <mpi.h>
 
 #define NSPEEDS         9
 #define FINALSTATEFILE  "final_state.dat"
@@ -117,12 +118,37 @@ float calc_reynolds(const t_param params, t_speed* cells, int* obstacles);
 void die(const char* message, const int line, const char* file);
 void usage(const char* exe);
 
+int exchange_halos(const t_param params,
+                   t_speed* local_cells,
+                   int* local_obstacles,
+                   int local_ny,
+                   int up,
+                   int down);
+
+int timestep_local(const t_param params,
+                   t_speed** local_cells_ptr,
+                   t_speed** local_tmp_cells_ptr,
+                   int* local_obstacles,
+                   int local_ny,
+                   int start_y,
+                   int up,
+                   int down,
+                   float* local_tot_u,
+                   int* local_tot_cells);
+
 /*
 ** main program:
 ** initialise, timestep loop, finalise
 */
 int main(int argc, char* argv[])
 {
+  int rank = 0;
+  int size = 1;
+
+  MPI_Init(&argc, &argv);
+  MPI_Comm_rank(MPI_COMM_WORLD, &rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &size);
+
   char*    paramfile = NULL;    /* name of the input parameter file */
   char*    obstaclefile = NULL; /* name of a the input obstacle file */
   t_param  params;              /* struct to hold parameter values */
@@ -150,6 +176,68 @@ int main(int argc, char* argv[])
   init_tic=tot_tic;
   initialise(paramfile, obstaclefile, &params, &cells, &tmp_cells, &obstacles, &av_vels);
 
+  /* Work out the row range owned by this rank */
+  int base_rows = params.ny / size;
+  int extra_rows = params.ny % size;
+
+  int local_ny;
+  int start_y;
+
+  int up = (rank == 0) ? size - 1 : rank - 1;
+  int down = (rank == size - 1) ? 0 : rank + 1;
+  printf("Rank %d: up=%d down=%d\n", rank, up, down);
+
+  if (rank < extra_rows)
+  {
+    local_ny = base_rows + 1;
+    start_y = rank * local_ny;
+  }
+  else
+  {
+    local_ny = base_rows;
+    start_y = extra_rows * (base_rows + 1)
+            + (rank - extra_rows) * base_rows;
+  }
+
+  int end_y = start_y + local_ny - 1;
+
+  printf("Rank %d/%d owns rows %d to %d (%d rows)\n",
+          rank, size, start_y, end_y, local_ny);
+
+  int local_nrows_with_halo = local_ny + 2;
+  int local_size = local_nrows_with_halo * params.nx;
+
+  t_speed* local_cells = malloc(sizeof(t_speed) * local_size);
+  t_speed* local_tmp_cells = malloc(sizeof(t_speed) * local_size);
+  int* local_obstacles = malloc(sizeof(int) * local_size);
+
+  if (!local_cells || !local_tmp_cells || !local_obstacles)
+  {
+    die("cannot allocate local arrays", __LINE__, __FILE__);
+  } 
+
+  /* copy real rows */
+  for (int jj = 0; jj < local_ny; jj++)
+  {
+    int global_jj = start_y + jj;
+    int local_jj = jj + 1;
+
+    for (int ii = 0; ii < params.nx; ii++)
+    {
+      int global_idx = ii + global_jj * params.nx;
+      int local_idx = ii + local_jj * params.nx;
+
+      local_cells[local_idx] = cells[global_idx];
+      local_tmp_cells[local_idx] = tmp_cells[global_idx];
+      local_obstacles[local_idx] = obstacles[global_idx];
+    }
+  }
+
+  /* debug print */
+  printf("Rank %d local rows = %d (+2 halo)\n", rank, local_ny);
+
+  
+
   /* Init time stops here, compute time starts*/
   gettimeofday(&timstr, NULL);
   init_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
@@ -157,12 +245,29 @@ int main(int argc, char* argv[])
 
   for (int tt = 0; tt < params.maxIters; tt++)
   {
-    av_vels[tt] = timestep(params, &cells, &tmp_cells, obstacles);
-#ifdef DEBUG
-    printf("==timestep: %d==\n", tt);
-    printf("av velocity: %.12E\n", av_vels[tt]);
-    printf("tot density: %.12E\n", total_density(params, cells));
-#endif
+    float local_tot_u = 0.f;
+    float global_tot_u = 0.f;
+    int local_tot_cells = 0;
+    int global_tot_cells = 0;
+
+    timestep_local(params,
+                  &local_cells,
+                  &local_tmp_cells,
+                  local_obstacles,
+                  local_ny,
+                  start_y,
+                  up,
+                  down,
+                  &local_tot_u,
+                  &local_tot_cells);
+
+    MPI_Allreduce(&local_tot_u, &global_tot_u, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
+    MPI_Allreduce(&local_tot_cells, &global_tot_cells, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+
+    if (rank == 0)
+    {
+      av_vels[tt] = global_tot_u / (float)global_tot_cells;
+    }
   }
   
   /* Compute time stops here, collate time starts*/
@@ -172,20 +277,39 @@ int main(int argc, char* argv[])
 
   // Collate data from ranks here 
 
+ 
+
   /* Total/collate time stops here.*/
-  gettimeofday(&timstr, NULL);
+  gettimeofday(&timstr, NULL); 
+  
+  MPI_Gather(
+    &local_cells[1 * params.nx],
+    local_ny * params.nx * sizeof(t_speed),
+    MPI_BYTE,
+    cells,
+    local_ny * params.nx * sizeof(t_speed),
+    MPI_BYTE,
+    0,
+    MPI_COMM_WORLD
+  );
   col_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
   tot_toc = col_toc;
   
   /* write final values and free memory */
-  printf("==done==\n");
-  printf("Reynolds number:\t\t%.12E\n", calc_reynolds(params, cells, obstacles));
-  printf("Elapsed Init time:\t\t\t%.6lf (s)\n",    init_toc - init_tic);
-  printf("Elapsed Compute time:\t\t\t%.6lf (s)\n", comp_toc - comp_tic);
-  printf("Elapsed Collate time:\t\t\t%.6lf (s)\n", col_toc  - col_tic);
-  printf("Elapsed Total time:\t\t\t%.6lf (s)\n",   tot_toc  - tot_tic);
-  write_values(params, cells, obstacles, av_vels);
+  if (rank == 0)
+  {
+    printf("==done==\n");
+    printf("MPI ranks:\t\t%d\n", size);
+    printf("Reynolds number:\t\t%.12E\n", calc_reynolds(params, cells, obstacles));
+    printf("Elapsed Init time:\t\t\t%.6lf (s)\n",    init_toc - init_tic);
+    printf("Elapsed Compute time:\t\t\t%.6lf (s)\n", comp_toc - comp_tic);
+    printf("Elapsed Collate time:\t\t\t%.6lf (s)\n", col_toc  - col_tic);
+    printf("Elapsed Total time:\t\t\t%.6lf (s)\n",   tot_toc  - tot_tic);
+    write_values(params, cells, obstacles, av_vels);
+  } 
+
   finalise(&params, &cells, &tmp_cells, &obstacles, &av_vels);
+  MPI_Finalize();
 
   return EXIT_SUCCESS;
 }
@@ -269,6 +393,186 @@ static inline void process_cell_fused(
   tmp_cells[idx].speeds[8] = s8 + omega * (feq8 - s8);
 }
 
+int exchange_halos(const t_param params,
+                   t_speed* local_cells,
+                   int* local_obstacles,
+                   int local_ny,
+                   int up,
+                   int down)
+{
+  const int nx = params.nx;
+  const int row_speeds = nx * sizeof(t_speed);
+  const int row_obs = nx;
+
+  /* local row layout:
+     0              = top halo
+     1              = first real row
+     local_ny       = last real row
+     local_ny + 1   = bottom halo
+  */
+
+  MPI_Sendrecv(&local_cells[1 * nx], row_speeds, MPI_BYTE, up, 0,
+               &local_cells[(local_ny + 1) * nx], row_speeds, MPI_BYTE, down, 0,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  MPI_Sendrecv(&local_cells[local_ny * nx], row_speeds, MPI_BYTE, down, 1,
+               &local_cells[0 * nx], row_speeds, MPI_BYTE, up, 1,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  MPI_Sendrecv(&local_obstacles[1 * nx], row_obs, MPI_INT, up, 2,
+               &local_obstacles[(local_ny + 1) * nx], row_obs, MPI_INT, down, 2,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  MPI_Sendrecv(&local_obstacles[local_ny * nx], row_obs, MPI_INT, down, 3,
+               &local_obstacles[0 * nx], row_obs, MPI_INT, up, 3,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  return EXIT_SUCCESS;
+}
+
+int timestep_local(const t_param params,
+                   t_speed** local_cells_ptr,
+                   t_speed** local_tmp_cells_ptr,
+                   int* local_obstacles,
+                   int local_ny,
+                   int start_y,
+                   int up,
+                   int down,
+                   float* local_tot_u,
+                   int* local_tot_cells)
+{
+  t_speed* local_cells = *local_cells_ptr;
+  t_speed* local_tmp_cells = *local_tmp_cells_ptr;
+
+  const int nx = params.nx;
+  const int global_ny = params.ny;
+  const float omega = params.omega;
+
+  const float w0 = 4.f / 9.f;
+  const float w1 = 1.f / 9.f;
+  const float w2 = 1.f / 36.f;
+
+  const float accel_w1 = params.density * params.accel / 9.f;
+  const float accel_w2 = params.density * params.accel / 36.f;
+
+  const float c1 = 3.f;
+  const float c2 = 4.5f;
+  const float c3 = 1.5f;
+
+  *local_tot_u = 0.f;
+  *local_tot_cells = 0;
+
+  /* Apply acceleration before propagation, only on the rank that owns global row ny-2 */
+  const int accel_global_jj = global_ny - 2;
+
+  if (accel_global_jj >= start_y && accel_global_jj < start_y + local_ny)
+  {
+    int accel_local_jj = (accel_global_jj - start_y) + 1;
+
+    for (int ii = 0; ii < nx; ii++)
+    {
+      int idx = ii + accel_local_jj * nx;
+
+      if (!local_obstacles[idx]
+          && (local_cells[idx].speeds[3] - accel_w1) > 0.f
+          && (local_cells[idx].speeds[6] - accel_w2) > 0.f
+          && (local_cells[idx].speeds[7] - accel_w2) > 0.f)
+          {
+            local_cells[idx].speeds[1] += accel_w1;
+            local_cells[idx].speeds[5] += accel_w2;
+            local_cells[idx].speeds[8] += accel_w2;
+
+            local_cells[idx].speeds[3] -= accel_w1;
+            local_cells[idx].speeds[6] -= accel_w2;
+            local_cells[idx].speeds[7] -= accel_w2;
+          }
+      }
+  }
+
+
+  exchange_halos(params, local_cells, local_obstacles, local_ny, up, down);
+
+  for (int local_jj = 1; local_jj <= local_ny; local_jj++)
+  {
+
+    for (int ii = 0; ii < nx; ii++)
+    {
+      const int x_w = (ii == 0) ? nx - 1 : ii - 1;
+      const int x_e = (ii == nx - 1) ? 0 : ii + 1;
+
+      const int idx = ii + local_jj * nx;
+      const int y_s = local_jj - 1;
+      const int y_n = local_jj + 1;
+
+      float s0 = local_cells[idx].speeds[0];
+      float s1 = local_cells[x_w + local_jj * nx].speeds[1];
+      float s2 = local_cells[ii  + y_s      * nx].speeds[2];
+      float s3 = local_cells[x_e + local_jj * nx].speeds[3];
+      float s4 = local_cells[ii  + y_n      * nx].speeds[4];
+      float s5 = local_cells[x_w + y_s      * nx].speeds[5];
+      float s6 = local_cells[x_e + y_s      * nx].speeds[6];
+      float s7 = local_cells[x_e + y_n      * nx].speeds[7];
+      float s8 = local_cells[x_w + y_n      * nx].speeds[8];
+
+      if (local_obstacles[idx])
+      {
+        local_tmp_cells[idx].speeds[0] = s0;
+        local_tmp_cells[idx].speeds[1] = s3;
+        local_tmp_cells[idx].speeds[2] = s4;
+        local_tmp_cells[idx].speeds[3] = s1;
+        local_tmp_cells[idx].speeds[4] = s2;
+        local_tmp_cells[idx].speeds[5] = s7;
+        local_tmp_cells[idx].speeds[6] = s8;
+        local_tmp_cells[idx].speeds[7] = s5;
+        local_tmp_cells[idx].speeds[8] = s6;
+        continue;
+      }
+
+      const float local_density = s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8;
+
+      const float u_x = (s1 + s5 + s8 - (s3 + s6 + s7)) / local_density;
+      const float u_y = (s2 + s5 + s6 - (s4 + s7 + s8)) / local_density;
+      const float u_sq = u_x * u_x + u_y * u_y;
+
+      *local_tot_u += sqrtf(u_sq);
+      (*local_tot_cells)++;
+
+      const float u1 =  u_x;
+      const float u2 =  u_y;
+      const float u3 = -u_x;
+      const float u4 = -u_y;
+      const float u5 =  u_x + u_y;
+      const float u6 = -u_x + u_y;
+      const float u7 = -u_x - u_y;
+      const float u8 =  u_x - u_y;
+
+      const float feq0 = w0 * local_density * (1.f - c3 * u_sq);
+      const float feq1 = w1 * local_density * (1.f + c1*u1 + c2*u1*u1 - c3*u_sq);
+      const float feq2 = w1 * local_density * (1.f + c1*u2 + c2*u2*u2 - c3*u_sq);
+      const float feq3 = w1 * local_density * (1.f + c1*u3 + c2*u3*u3 - c3*u_sq);
+      const float feq4 = w1 * local_density * (1.f + c1*u4 + c2*u4*u4 - c3*u_sq);
+      const float feq5 = w2 * local_density * (1.f + c1*u5 + c2*u5*u5 - c3*u_sq);
+      const float feq6 = w2 * local_density * (1.f + c1*u6 + c2*u6*u6 - c3*u_sq);
+      const float feq7 = w2 * local_density * (1.f + c1*u7 + c2*u7*u7 - c3*u_sq);
+      const float feq8 = w2 * local_density * (1.f + c1*u8 + c2*u8*u8 - c3*u_sq);
+
+      local_tmp_cells[idx].speeds[0] = s0 + omega * (feq0 - s0);
+      local_tmp_cells[idx].speeds[1] = s1 + omega * (feq1 - s1);
+      local_tmp_cells[idx].speeds[2] = s2 + omega * (feq2 - s2);
+      local_tmp_cells[idx].speeds[3] = s3 + omega * (feq3 - s3);
+      local_tmp_cells[idx].speeds[4] = s4 + omega * (feq4 - s4);
+      local_tmp_cells[idx].speeds[5] = s5 + omega * (feq5 - s5);
+      local_tmp_cells[idx].speeds[6] = s6 + omega * (feq6 - s6);
+      local_tmp_cells[idx].speeds[7] = s7 + omega * (feq7 - s7);
+      local_tmp_cells[idx].speeds[8] = s8 + omega * (feq8 - s8);
+    }
+  }
+
+  *local_cells_ptr = local_tmp_cells;
+  *local_tmp_cells_ptr = local_cells;
+
+  return EXIT_SUCCESS;
+}
 
 float timestep(const t_param params, t_speed** cells_ptr, t_speed** tmp_cells_ptr, int* obstacles)
 {
