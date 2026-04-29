@@ -92,7 +92,7 @@ int initialise(const char* paramfile, const char* obstaclefile,
 ** timestep calls, in order, the functions:
 ** accelerate_flow(), propagate(), rebound() & collision()
 */
-int timestep(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles);
+float timestep(const t_param params, t_speed** cells_ptr, t_speed** tmp_cells_ptr, int* obstacles);
 int accelerate_flow(const t_param params, t_speed* cells, int* obstacles);
 int propagate(const t_param params, t_speed* cells, t_speed* tmp_cells);
 int rebound(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles);
@@ -157,8 +157,7 @@ int main(int argc, char* argv[])
 
   for (int tt = 0; tt < params.maxIters; tt++)
   {
-    timestep(params, cells, tmp_cells, obstacles);
-    av_vels[tt] = av_velocity(params, cells, obstacles);
+    av_vels[tt] = timestep(params, &cells, &tmp_cells, obstacles);
 #ifdef DEBUG
     printf("==timestep: %d==\n", tt);
     printf("av velocity: %.12E\n", av_vels[tt]);
@@ -191,13 +190,158 @@ int main(int argc, char* argv[])
   return EXIT_SUCCESS;
 }
 
-int timestep(const t_param params, t_speed* cells, t_speed* tmp_cells, int* obstacles)
+static inline void process_cell_fused(
+    const int ii, const int row, const int row_s, const int row_n,
+    const int x_w, const int x_e, const int idx,
+    const float omega,
+    t_speed* restrict cells,
+    t_speed* restrict tmp_cells,
+    const int* restrict obstacles,
+    float* restrict tot_u,
+    int* restrict tot_cells)
 {
+  const float w0 = 4.f / 9.f;
+  const float w1 = 1.f / 9.f;
+  const float w2 = 1.f / 36.f;
+  const float c1 = 3.f;
+  const float c2 = 4.5f;
+  const float c3 = 1.5f;
+
+  const float s0 = cells[idx].speeds[0];
+  const float s1 = cells[x_w + row].speeds[1];
+  const float s2 = cells[ii  + row_s].speeds[2];
+  const float s3 = cells[x_e + row].speeds[3];
+  const float s4 = cells[ii  + row_n].speeds[4];
+  const float s5 = cells[x_w + row_s].speeds[5];
+  const float s6 = cells[x_e + row_s].speeds[6];
+  const float s7 = cells[x_e + row_n].speeds[7];
+  const float s8 = cells[x_w + row_n].speeds[8];
+
+  if (obstacles[idx])
+  {
+    tmp_cells[idx].speeds[0] = s0;
+    tmp_cells[idx].speeds[1] = s3;
+    tmp_cells[idx].speeds[2] = s4;
+    tmp_cells[idx].speeds[3] = s1;
+    tmp_cells[idx].speeds[4] = s2;
+    tmp_cells[idx].speeds[5] = s7;
+    tmp_cells[idx].speeds[6] = s8;
+    tmp_cells[idx].speeds[7] = s5;
+    tmp_cells[idx].speeds[8] = s6;
+    return;
+  }
+
+  const float local_density = s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7 + s8;
+  const float u_x = (s1 + s5 + s8 - (s3 + s6 + s7)) / local_density;
+  const float u_y = (s2 + s5 + s6 - (s4 + s7 + s8)) / local_density;
+  const float u_sq = u_x * u_x + u_y * u_y;
+
+  *tot_u += sqrtf(u_sq);
+  ++(*tot_cells);
+
+  const float u1 =  u_x;
+  const float u2 =  u_y;
+  const float u3 = -u_x;
+  const float u4 = -u_y;
+  const float u5 =  u_x + u_y;
+  const float u6 = -u_x + u_y;
+  const float u7 = -u_x - u_y;
+  const float u8 =  u_x - u_y;
+
+  const float feq0 = w0 * local_density * (1.f - c3 * u_sq);
+  const float feq1 = w1 * local_density * (1.f + c1*u1 + c2*u1*u1 - c3*u_sq);
+  const float feq2 = w1 * local_density * (1.f + c1*u2 + c2*u2*u2 - c3*u_sq);
+  const float feq3 = w1 * local_density * (1.f + c1*u3 + c2*u3*u3 - c3*u_sq);
+  const float feq4 = w1 * local_density * (1.f + c1*u4 + c2*u4*u4 - c3*u_sq);
+  const float feq5 = w2 * local_density * (1.f + c1*u5 + c2*u5*u5 - c3*u_sq);
+  const float feq6 = w2 * local_density * (1.f + c1*u6 + c2*u6*u6 - c3*u_sq);
+  const float feq7 = w2 * local_density * (1.f + c1*u7 + c2*u7*u7 - c3*u_sq);
+  const float feq8 = w2 * local_density * (1.f + c1*u8 + c2*u8*u8 - c3*u_sq);
+
+  tmp_cells[idx].speeds[0] = s0 + omega * (feq0 - s0);
+  tmp_cells[idx].speeds[1] = s1 + omega * (feq1 - s1);
+  tmp_cells[idx].speeds[2] = s2 + omega * (feq2 - s2);
+  tmp_cells[idx].speeds[3] = s3 + omega * (feq3 - s3);
+  tmp_cells[idx].speeds[4] = s4 + omega * (feq4 - s4);
+  tmp_cells[idx].speeds[5] = s5 + omega * (feq5 - s5);
+  tmp_cells[idx].speeds[6] = s6 + omega * (feq6 - s6);
+  tmp_cells[idx].speeds[7] = s7 + omega * (feq7 - s7);
+  tmp_cells[idx].speeds[8] = s8 + omega * (feq8 - s8);
+}
+
+
+float timestep(const t_param params, t_speed** cells_ptr, t_speed** tmp_cells_ptr, int* obstacles)
+{
+  t_speed* cells = *cells_ptr;
+  t_speed* tmp_cells = *tmp_cells_ptr;
+
   accelerate_flow(params, cells, obstacles);
-  propagate(params, cells, tmp_cells);
-  rebound(params, cells, tmp_cells, obstacles);
-  collision(params, cells, tmp_cells, obstacles);
-  return EXIT_SUCCESS;
+
+  const int nx = params.nx;
+  const int ny = params.ny;
+  const float omega = params.omega;
+
+  float tot_u = 0.f;
+  int tot_cells = 0;
+
+  /* Bottom boundary row: preserve periodic wrap-around. */
+  {
+    const int row = 0;
+    const int row_s = (ny - 1) * nx;
+    const int row_n = nx;
+    for (int ii = 0; ii < nx; ii++)
+    {
+      const int x_w = (ii == 0) ? (nx - 1) : (ii - 1);
+      const int x_e = (ii == nx - 1) ? 0 : (ii + 1);
+      const int idx = ii;
+      process_cell_fused(ii, row, row_s, row_n, x_w, x_e, idx,
+                         omega, cells, tmp_cells, obstacles, &tot_u, &tot_cells);
+    }
+  }
+
+  /* Interior rows. Only left/right columns need x wrap-around. */
+  for (int jj = 1; jj < ny - 1; jj++)
+  {
+    const int row = jj * nx;
+    const int row_s = row - nx;
+    const int row_n = row + nx;
+
+    /* Left boundary column. */
+    process_cell_fused(0, row, row_s, row_n, nx - 1, 1, row,
+                       omega, cells, tmp_cells, obstacles, &tot_u, &tot_cells);
+
+    /* Fast interior: no %, no ternary neighbour-index calculations. */
+    for (int ii = 1; ii < nx - 1; ii++)
+    {
+      const int idx = ii + row;
+      process_cell_fused(ii, row, row_s, row_n, ii - 1, ii + 1, idx,
+                         omega, cells, tmp_cells, obstacles, &tot_u, &tot_cells);
+    }
+
+    /* Right boundary column. */
+    process_cell_fused(nx - 1, row, row_s, row_n, nx - 2, 0, row + nx - 1,
+                       omega, cells, tmp_cells, obstacles, &tot_u, &tot_cells);
+  }
+
+  /* Top boundary row: preserve periodic wrap-around. */
+  {
+    const int row = (ny - 1) * nx;
+    const int row_s = row - nx;
+    const int row_n = 0;
+    for (int ii = 0; ii < nx; ii++)
+    {
+      const int x_w = (ii == 0) ? (nx - 1) : (ii - 1);
+      const int x_e = (ii == nx - 1) ? 0 : (ii + 1);
+      const int idx = ii + row;
+      process_cell_fused(ii, row, row_s, row_n, x_w, x_e, idx,
+                         omega, cells, tmp_cells, obstacles, &tot_u, &tot_cells);
+    }
+  }
+
+  *cells_ptr = tmp_cells;
+  *tmp_cells_ptr = cells;
+
+  return tot_u / (float)tot_cells;
 }
 
 int accelerate_flow(const t_param params, t_speed* cells, int* obstacles)
