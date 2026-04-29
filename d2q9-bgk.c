@@ -185,7 +185,7 @@ int main(int argc, char* argv[])
 
   int up = (rank == 0) ? size - 1 : rank - 1;
   int down = (rank == size - 1) ? 0 : rank + 1;
-  printf("Rank %d: up=%d down=%d\n", rank, up, down);
+  //printf("Rank %d: up=%d down=%d\n", rank, up, down);
 
   if (rank < extra_rows)
   {
@@ -199,10 +199,9 @@ int main(int argc, char* argv[])
             + (rank - extra_rows) * base_rows;
   }
 
-  int end_y = start_y + local_ny - 1;
-
-  printf("Rank %d/%d owns rows %d to %d (%d rows)\n",
-          rank, size, start_y, end_y, local_ny);
+  //int end_y = start_y + local_ny - 1;
+  //printf("Rank %d/%d owns rows %d to %d (%d rows)\n",
+  //        rank, size, start_y, end_y, local_ny);
 
   int local_nrows_with_halo = local_ny + 2;
   int local_size = local_nrows_with_halo * params.nx;
@@ -234,7 +233,7 @@ int main(int argc, char* argv[])
   }
 
   /* debug print */
-  printf("Rank %d local rows = %d (+2 halo)\n", rank, local_ny);
+  //printf("Rank %d local rows = %d (+2 halo)\n", rank, local_ny);
 
   
 
@@ -281,17 +280,63 @@ int main(int argc, char* argv[])
 
   /* Total/collate time stops here.*/
   gettimeofday(&timstr, NULL); 
-  
-  MPI_Gather(
-    &local_cells[1 * params.nx],
-    local_ny * params.nx * sizeof(t_speed),
-    MPI_BYTE,
-    cells,
-    local_ny * params.nx * sizeof(t_speed),
-    MPI_BYTE,
-    0,
-    MPI_COMM_WORLD
-  );
+
+  int local_bytes = local_ny * params.nx * sizeof(t_speed);
+
+  int* recvcounts = NULL;
+  int* displs = NULL;
+
+  if (rank == 0)
+  {
+    recvcounts = malloc(sizeof(int) * size);
+    displs = malloc(sizeof(int) * size);
+
+    if (!recvcounts || !displs)
+    {
+    die("cannot allocate recvcounts/displs", __LINE__, __FILE__);
+    }
+
+    for (int r = 0; r < size; r++)
+    {
+      int r_base_rows = params.ny / size;
+      int r_extra_rows = params.ny % size;
+
+      int r_local_ny;
+      int r_start_y;
+
+      if (r < r_extra_rows)
+      {
+        r_local_ny = r_base_rows + 1;
+        r_start_y = r * r_local_ny;
+      }
+      else
+      {
+        r_local_ny = r_base_rows;
+        r_start_y = r_extra_rows * (r_base_rows + 1)
+                  + (r - r_extra_rows) * r_base_rows;
+      }
+
+      recvcounts[r] = r_local_ny * params.nx * sizeof(t_speed);
+      displs[r] = r_start_y * params.nx * sizeof(t_speed);
+    }
+  }
+
+  MPI_Gatherv(&local_cells[1 * params.nx],
+              local_bytes,
+              MPI_BYTE,
+              cells,
+              recvcounts,
+              displs,
+              MPI_BYTE,
+              0,
+              MPI_COMM_WORLD);
+
+  if (rank == 0)
+  {
+    free(recvcounts);
+    free(displs);
+  }
+
   col_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
   tot_toc = col_toc;
   
