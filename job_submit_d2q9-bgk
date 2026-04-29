@@ -6,21 +6,24 @@
 #SBATCH --cpus-per-task=1
 #SBATCH --time=00:10:00
 #SBATCH --output=d2q9-bgk.out
-#SBATCH --exclusive 
+#SBATCH --error=d2q9-bgk.err
+#SBATCH --exclusive
+
+source ./env.sh
 
 echo Running on host `hostname`
 echo Time is `date`
 echo Directory is `pwd`
 echo Slurm job ID is $SLURM_JOB_ID
 echo This job runs on the following machines:
-echo `echo $SLURM_JOB_NODELIST | uniq`
+echo $SLURM_JOB_NODELIST
 
-GRID=128x128
-#GRID=128x256
-#GRID=256x256
-#GRID=1024x1024
+make clean
+make
 
-#! Run the executable
-./d2q9-bgk input_$GRID.params obstacles_$GRID.dat
+#GRID=128x128
+GRID=1024x1024
+
+srun ./d2q9-bgk input_$GRID.params obstacles_$GRID.dat
 make check REF_AV_VELS_FILE=check/$GRID.av_vels.dat REF_FINAL_STATE_FILE=check/$GRID.final_state.dat
 
