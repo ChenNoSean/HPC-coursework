@@ -2,12 +2,16 @@
 
 #SBATCH --job-name=d2q9-bgk
 #SBATCH --nodes=1
-#SBATCH --ntasks-per-node=1
+#SBATCH --ntasks-per-node=16
 #SBATCH --cpus-per-task=1
-#SBATCH --time=00:10:00
+#SBATCH --time=03:00:00
 #SBATCH --output=d2q9-bgk.out
 #SBATCH --error=d2q9-bgk.err
 #SBATCH --exclusive
+
+#export OMP_NUM_THREADS=1
+#export OMP_PROC_BIND=true
+#export OMP_PLACES=cores
 
 source ./env.sh
 
@@ -21,9 +25,18 @@ echo $SLURM_JOB_NODELIST
 make clean
 make
 
+INPUTDIR=/projects/b35cg/public/d2q9-bgk-inputs
+#GRID=2048x2048
+GRID=4096x4096
 #GRID=128x128
-GRID=1024x1024
+#GRID=1024x1024
 
-srun ./d2q9-bgk input_$GRID.params obstacles_$GRID.dat
-make check REF_AV_VELS_FILE=check/$GRID.av_vels.dat REF_FINAL_STATE_FILE=check/$GRID.final_state.dat
+srun ./d2q9-bgk \
+  $INPUTDIR/input_$GRID.params \
+  $INPUTDIR/obstacles_$GRID.dat
 
+python3 $INPUTDIR/check/check.py \
+  --ref-av-vels-file=$INPUTDIR/check/$GRID.av_vels.dat \
+  --ref-final-state-file=$INPUTDIR/check/$GRID.final_state.dat \
+  --av-vels-file=./av_vels.dat \
+  --final-state-file=./final_state.dat

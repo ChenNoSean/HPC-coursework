@@ -111,6 +111,13 @@ float total_density(const t_param params, t_speed* cells);
 /* compute average velocity */
 float av_velocity(const t_param params, t_speed* cells, int* obstacles);
 
+int av_velocity_local(const t_param params,
+                      t_speed* local_cells,
+                      int* local_obstacles,
+                      int local_ny,
+                      float* local_tot_u,
+                      int* local_tot_cells);
+
 /* calculate Reynolds number */
 float calc_reynolds(const t_param params, t_speed* cells, int* obstacles);
 
@@ -124,6 +131,18 @@ int exchange_halos(const t_param params,
                    int local_ny,
                    int up,
                    int down);
+
+int exchange_cell_halos(const t_param params,
+                        t_speed* local_cells,
+                        int local_ny,
+                        int up,
+                        int down);
+
+int exchange_obstacle_halos(const t_param params,
+                            int* local_obstacles,
+                            int local_ny,
+                            int up,
+                            int down);
 
 int timestep_local(const t_param params,
                    t_speed** local_cells_ptr,
@@ -232,6 +251,23 @@ int main(int argc, char* argv[])
     }
   }
 
+  /* Obstacles are static, so exchange obstacle halo rows once after initialisation. */
+  exchange_obstacle_halos(params, local_obstacles, local_ny, up, down);
+
+  /* Free full global arrays after local copy to avoid OOM.
+     Rank 0 keeps cells/obstacles for final MPI_Gatherv and output. */
+  free(tmp_cells);
+  tmp_cells = NULL;
+
+  if (rank != 0)
+  {
+    free(cells);
+    cells = NULL;
+
+    free(obstacles);
+    obstacles = NULL;
+  }
+
   /* debug print */
   //printf("Rank %d local rows = %d (+2 halo)\n", rank, local_ny);
 
@@ -250,21 +286,35 @@ int main(int argc, char* argv[])
     int global_tot_cells = 0;
 
     timestep_local(params,
-                  &local_cells,
-                  &local_tmp_cells,
-                  local_obstacles,
-                  local_ny,
-                  start_y,
-                  up,
-                  down,
-                  &local_tot_u,
-                  &local_tot_cells);
+              &local_cells,
+              &local_tmp_cells,
+              local_obstacles,
+              local_ny,
+              start_y,
+              up,
+              down,
+              &local_tot_u,
+              &local_tot_cells);
 
-    MPI_Allreduce(&local_tot_u, &global_tot_u, 1, MPI_FLOAT, MPI_SUM, MPI_COMM_WORLD);
-    MPI_Allreduce(&local_tot_cells, &global_tot_cells, 1, MPI_INT, MPI_SUM, MPI_COMM_WORLD);
+    /* Reduce fused local average-velocity contribution to rank 0. */
+    double local_vals[2];
+    double global_vals[2];
+
+    local_vals[0] = (double)local_tot_u;
+    local_vals[1] = (double)local_tot_cells;
+
+    MPI_Reduce(local_vals,
+               global_vals,
+               2,
+               MPI_DOUBLE,
+               MPI_SUM,
+               0,
+               MPI_COMM_WORLD);
 
     if (rank == 0)
     {
+      global_tot_u = (float)global_vals[0];
+      global_tot_cells = (int)global_vals[1];
       av_vels[tt] = global_tot_u / (float)global_tot_cells;
     }
   }
@@ -279,8 +329,6 @@ int main(int argc, char* argv[])
  
 
   /* Total/collate time stops here.*/
-  gettimeofday(&timstr, NULL); 
-
   int local_bytes = local_ny * params.nx * sizeof(t_speed);
 
   int* recvcounts = NULL;
@@ -337,6 +385,7 @@ int main(int argc, char* argv[])
     free(displs);
   }
 
+  gettimeofday(&timstr, NULL); 
   col_toc = timstr.tv_sec + (timstr.tv_usec / 1000000.0);
   tot_toc = col_toc;
   
@@ -475,6 +524,46 @@ int exchange_halos(const t_param params,
   return EXIT_SUCCESS;
 }
 
+int exchange_cell_halos(const t_param params,
+                        t_speed* local_cells,
+                        int local_ny,
+                        int up,
+                        int down)
+{
+  const int nx = params.nx;
+  const int row_speeds = nx * sizeof(t_speed);
+
+  MPI_Sendrecv(&local_cells[1 * nx], row_speeds, MPI_BYTE, up, 0,
+               &local_cells[(local_ny + 1) * nx], row_speeds, MPI_BYTE, down, 0,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  MPI_Sendrecv(&local_cells[local_ny * nx], row_speeds, MPI_BYTE, down, 1,
+               &local_cells[0 * nx], row_speeds, MPI_BYTE, up, 1,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  return EXIT_SUCCESS;
+}
+
+int exchange_obstacle_halos(const t_param params,
+                            int* local_obstacles,
+                            int local_ny,
+                            int up,
+                            int down)
+{
+  const int nx = params.nx;
+  const int row_obs = nx;
+
+  MPI_Sendrecv(&local_obstacles[1 * nx], row_obs, MPI_INT, up, 2,
+               &local_obstacles[(local_ny + 1) * nx], row_obs, MPI_INT, down, 2,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  MPI_Sendrecv(&local_obstacles[local_ny * nx], row_obs, MPI_INT, down, 3,
+               &local_obstacles[0 * nx], row_obs, MPI_INT, up, 3,
+               MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+
+  return EXIT_SUCCESS;
+}
+
 int timestep_local(const t_param params,
                    t_speed** local_cells_ptr,
                    t_speed** local_tmp_cells_ptr,
@@ -535,7 +624,7 @@ int timestep_local(const t_param params,
   }
 
 
-  exchange_halos(params, local_cells, local_obstacles, local_ny, up, down);
+  exchange_cell_halos(params, local_cells, local_ny, up, down);
 
   for (int local_jj = 1; local_jj <= local_ny; local_jj++)
   {
@@ -581,7 +670,7 @@ int timestep_local(const t_param params,
 
       *local_tot_u += sqrtf(u_sq);
       (*local_tot_cells)++;
-
+      
       const float u1 =  u_x;
       const float u2 =  u_y;
       const float u3 = -u_x;
@@ -691,6 +780,58 @@ float timestep(const t_param params, t_speed** cells_ptr, t_speed** tmp_cells_pt
   *tmp_cells_ptr = cells;
 
   return tot_u / (float)tot_cells;
+}
+
+int av_velocity_local(const t_param params,
+                      t_speed* local_cells,
+                      int* local_obstacles,
+                      int local_ny,
+                      float* local_tot_u,
+                      int* local_tot_cells)
+{
+  *local_tot_u = 0.f;
+  *local_tot_cells = 0;
+
+  const int nx = params.nx;
+
+  for (int jj = 1; jj <= local_ny; jj++)
+  {
+    for (int ii = 0; ii < nx; ii++)
+    {
+      int idx = ii + jj * nx;
+
+      if (!local_obstacles[idx])
+      {
+        float local_density = 0.f;
+
+        for (int kk = 0; kk < NSPEEDS; kk++)
+        {
+          local_density += local_cells[idx].speeds[kk];
+        }
+
+        float u_x = (local_cells[idx].speeds[1]
+                    + local_cells[idx].speeds[5]
+                    + local_cells[idx].speeds[8]
+                    - (local_cells[idx].speeds[3]
+                    + local_cells[idx].speeds[6]
+                    + local_cells[idx].speeds[7]))
+                    / local_density;
+
+        float u_y = (local_cells[idx].speeds[2]
+                    + local_cells[idx].speeds[5]
+                    + local_cells[idx].speeds[6]
+                    - (local_cells[idx].speeds[4]
+                    + local_cells[idx].speeds[7]
+                    + local_cells[idx].speeds[8]))
+                    / local_density;
+
+        *local_tot_u += sqrtf((u_x * u_x) + (u_y * u_y));
+        (*local_tot_cells)++;
+      }
+    }
+  }
+
+  return EXIT_SUCCESS;
 }
 
 int accelerate_flow(const t_param params, t_speed* cells, int* obstacles)
